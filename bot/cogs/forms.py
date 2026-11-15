@@ -37,12 +37,23 @@ class FormModal(discord.ui.Modal):
         base = form.get("title") or "Заявка"
         super().__init__(title=(f"{base} · {choice['label']}" if choice else base)[:45], timeout=900)
         self.cog, self.key, self.form, self.choice = cog, key, form, choice
-        self.inputs: dict[str, discord.ui.TextInput] = {}
+        self.inputs: dict[str, discord.ui.TextInput | discord.ui.Select] = {}
         for f in (form.get("fields") or [])[:5]:
+            label = (f.get("label") or "Поле")[:45]
+            if f.get("style") == "select":
+                opts = [o.strip()[:100] for o in re.split(r"[,\n]", f.get("options") or "") if o.strip()][:25]
+                if opts:
+                    cur = prefill.get(f["key"])
+                    sel = discord.ui.Select(required=bool(f.get("required")), options=[
+                        discord.SelectOption(label=o, value=o, default=(o == cur)) for o in opts],
+                        placeholder=(f.get("placeholder") or "Выберите…")[:100])
+                    self.add_item(discord.ui.Label(text=label, component=sel))
+                    self.inputs[f["key"]] = sel
+                    continue
             maxlen = max(1, min(int(f.get("max_length") or 100), 4000))
             default = (prefill.get(f["key"]) or "")[:maxlen] or None
             ti = discord.ui.TextInput(
-                label=(f.get("label") or "Поле")[:45],
+                label=label,
                 style=discord.TextStyle.paragraph if f.get("style") == "long" else discord.TextStyle.short,
                 required=bool(f.get("required")), placeholder=(f.get("placeholder") or "")[:100] or None,
                 max_length=maxlen, default=default)
@@ -50,7 +61,13 @@ class FormModal(discord.ui.Modal):
             self.inputs[f["key"]] = ti
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.submit(interaction, self.key, self.form, {k: (i.value or "").strip() for k, i in self.inputs.items()}, self.choice)
+        await self.cog.submit(interaction, self.key, self.form, {k: _val(i) for k, i in self.inputs.items()}, self.choice)
+
+
+def _val(i) -> str:
+    if isinstance(i, discord.ui.Select):
+        return (i.values[0] if i.values else "").strip()
+    return (i.value or "").strip()
 
 
 def _emoji(v):

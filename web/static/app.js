@@ -100,13 +100,35 @@ function control(f, val) {
     return { el: h('div', {}, chips, add), get: () => cur };
   }
   if (t === 'action') {
-    const s = h('select', {}, h('option', { value: '' }, '— нет действия —'), S.meta.actions.map(a => h('option', { value: a.value }, a.label)), h('option', { value: '__url' }, 'Ссылка (URL)…'));
-    const u = h('input', { type: 'text', placeholder: 'https://…', class: 'hidden' });
+    const TYPES = [['', '— ничего не делает —'], ['form', 'Открыть форму'], ['ticket', 'Открыть тикет'], ['cab', 'Личный кабинет'],
+      ['file', 'Моё личное дело'], ['roster', 'Показать составы'], ['role', 'Выдать / снять роль'], ['reply', 'Ответить текстом'], ['url', 'Открыть ссылку']];
+    const [k0, ...r0] = String(val || '').split(':'); const arg0 = r0.join(':');
     const isUrl = /^https?:\/\//.test(val || '');
-    if (isUrl) { s.value = '__url'; u.value = val; u.classList.remove('hidden'); }
-    else { if (val && ![...s.options].some(o => o.value === val)) s.append(h('option', { value: val }, `(недоступно) ${val}`)); s.value = val || ''; }
-    s.addEventListener('change', () => u.classList.toggle('hidden', s.value !== '__url'));
-    return { el: h('div', { style: 'display:grid;gap:6px' }, s, u), get: () => s.value === '__url' ? u.value.trim() : s.value };
+    const type = h('select', {}, TYPES.map(([v, l]) => h('option', { value: v }, l)));
+    const targets = { form: S.meta.forms || [], ticket: S.meta.tickets || [], role: S.meta.roles.map(r => ({ value: r.id, label: r.name })) };
+    const tsel = h('select', {}), url = h('input', { type: 'text', placeholder: 'https://…' });
+    const hint = h('small', { class: 'hint' });
+    const fill = (cur) => {
+      const kind = type.value, list = targets[kind];
+      tsel.classList.toggle('hidden', !list); url.classList.toggle('hidden', kind !== 'url');
+      hint.textContent = kind === 'reply' ? 'Текст ответа впишите в поле ниже.' : kind === 'form' && !(list || []).length ? 'Сначала создайте форму в разделе «Формы заявок».' : '';
+      if (list) {
+        tsel.replaceChildren(...list.map(o => h('option', { value: o.value }, o.label)));
+        if (cur && !list.some(o => o.value === cur)) tsel.append(h('option', { value: cur }, `(удалено) ${cur}`));
+        tsel.value = cur || (list[0] ? list[0].value : '');
+      }
+    };
+    if (isUrl) { type.value = 'url'; url.value = val; }
+    else if (TYPES.some(([v]) => v === k0)) type.value = k0; else type.value = '';
+    fill(arg0);
+    type.addEventListener('change', () => fill(''));
+    const get = () => { const k = type.value;
+      if (k === 'url') return url.value.trim();
+      if (k === 'reply') return 'reply';
+      if (targets[k]) return tsel.value ? `${k}:${tsel.value}` : '';
+      if (k === 'cab') return 'cab:home'; if (k === 'file') return 'file:me'; if (k === 'roster') return 'roster:show';
+      return ''; };
+    return { el: h('div', { style: 'display:grid;gap:6px' }, type, tsel, url, hint), get };
   }
   if (t === 'list') return listControl(f, val || []);
   const i = h('input', { type: 'text' }); i.value = val ?? ''; return { el: i, get: () => i.value };
@@ -288,7 +310,7 @@ async function viewItems(main, kind, key) {
   const nk = h('input', { type: 'text', placeholder: sch.key_hint || 'ключ', 'aria-label': 'Ключ нового элемента' });
   const addNew = async () => {
     const k = nk.value.trim().toLowerCase();
-    try { await api(G(`/items/${kind}/${encodeURIComponent(k)}`), { method: 'PUT', body: {} }); S.dirty = false; location.hash = `#/i/${kind}/${k}`; }
+    try { await api(G(`/items/${kind}/${encodeURIComponent(k)}`), { method: 'PUT', body: {} }); S.meta = await api(G('/meta')); S.dirty = false; location.hash = `#/i/${kind}/${k}`; }
     catch (e) { toast(e.message, true); }
   };
   nk.addEventListener('keydown', e => e.key === 'Enter' && addNew());
@@ -303,7 +325,7 @@ async function viewItems(main, kind, key) {
   const formBox = h('div', {}, form.el);
   let prev = null;
   const redraw = () => { if (kind !== 'panel') return; const n = embedPreview(form.collect(), st.brand_color); prev?.replaceWith(n); prev = n; };
-  const sb = saveBar(async () => { data = await api(G(`/items/${kind}/${key}`), { method: 'PUT', body: form.collect() }); toast('Сохранено'); },
+  const sb = saveBar(async () => { data = await api(G(`/items/${kind}/${key}`), { method: 'PUT', body: form.collect() }); S.meta = await api(G('/meta')); toast(data._publish_error ? 'Сохранено, но панель не обновилась: ' + data._publish_error : (kind === 'panel' && data._msg ? 'Сохранено и обновлено в Discord' : 'Сохранено'), !!data._publish_error); },
     () => { form = buildForm(sch.fields, data); formBox.replaceChildren(form.el); redraw(); sb.hide(); });
   const onChange = () => { sb.mark(); redraw(); };
   formBox.addEventListener('input', onChange); formBox.addEventListener('change', onChange);
@@ -321,7 +343,7 @@ async function viewItems(main, kind, key) {
   bar.append(h('button', { class: 'btn bad', onclick: async () => {
     if (!confirm(`Удалить «${label(key, data)}»?`)) return;
     const delMsg = kind === 'panel' && data._msg && confirm('Удалить и опубликованное сообщение в Discord?');
-    try { await api(G(`/items/${kind}/${key}?delete_message=${delMsg}`), { method: 'DELETE' }); S.dirty = false; location.hash = `#/i/${kind}`; } catch (er) { toast(er.message, true); }
+    try { await api(G(`/items/${kind}/${key}?delete_message=${delMsg}`), { method: 'DELETE' }); S.meta = await api(G('/meta')); S.dirty = false; location.hash = `#/i/${kind}`; } catch (er) { toast(er.message, true); }
   } }, 'Удалить'));
   right.append(bar, grid);
   grid.append(formBox);

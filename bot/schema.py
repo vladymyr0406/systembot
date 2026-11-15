@@ -94,6 +94,8 @@ SETTINGS_SCHEMA = [
         F("ticket_dm_transcript", "Отправлять транскрипт автору в ЛС", "bool", True),
     ]},
     {"group": "music", "title": "Музыка", "icon": "🎵", "fields": [
+        F("music_source", "Где искать музыку", "select", "auto", options=[
+            ["auto", "Авто: YouTube, при неудаче SoundCloud"], ["youtube", "Только YouTube"], ["soundcloud", "Только SoundCloud"]]),
         F("dj_roles", "DJ-роли (пусто = все)", "roles", []),
         F("music_channel", "Ограничить командами в канале", "channel", None),
         F("max_queue", "Максимум треков в очереди", "number", 100),
@@ -139,7 +141,8 @@ ITEM_SCHEMAS = {
             F("fields", "Поля формы (до 5)", "list", [], max=5, item=[
                 F("key", "Ключ (латиница)", "text", "field"),
                 F("label", "Название поля", "text", "Поле"),
-                F("style", "Размер", "select", "short", options=[["short", "Строка"], ["long", "Абзац"]]),
+                F("style", "Тип поля", "select", "short", options=[["short", "Строка"], ["long", "Абзац"], ["select", "Выпадающий список"]]),
+                F("options", "Варианты списка (через запятую или с новой строки; для типа «список»)", "textarea", ""),
                 F("required", "Обязательное", "bool", True),
                 F("placeholder", "Подсказка", "text", ""),
                 F("max_length", "Макс. длина", "number", 100),
@@ -159,7 +162,8 @@ ITEM_SCHEMAS = {
             F("footer", "Подпись (пусто = общая)", "text", ""),
             F("buttons", "Кнопки (до 25)", "list", [], max=25, item=[
                 F("label", "Текст", "text", "Кнопка"),
-                F("action", "Действие", "action", ""),
+                F("action", "Что делает кнопка", "action", ""),
+                F("reply", "Текст ответа (для действия «Ответить текстом»)", "textarea", ""),
                 F("style", "Цвет", "select", "primary", options=STYLE_OPTIONS),
                 F("emoji", "Эмодзи", "text", ""),
             ]),
@@ -378,7 +382,7 @@ for _mod, _cmds in {
     "mod_moderation": ["ban", "unban", "kick", "timeout", "untimeout", "warn", "warns", "unwarn", "cases", "purge", "slowmode", "lock", "unlock"],
     "mod_tickets": ["ticket"],
     "mod_news": ["news"],
-    "music_enabled": ["play", "pause", "skip", "stop", "leave", "queue", "nowplaying", "volume", "loop", "shuffle", "remove"],
+    "music_enabled": ["play", "pause", "skip", "stop", "leave", "queue", "nowplaying", "volume", "loop", "shuffle", "remove", "musiccheck"],
     "mod_fun": ["roll", "coin", "choose", "avatar", "userinfo", "serverinfo"],
 }.items():
     for _c in _cmds:

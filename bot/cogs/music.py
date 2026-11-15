@@ -1,7 +1,9 @@
 """Музыка: YouTube / SoundCloud через yt-dlp + FFmpeg. Очередь, повтор, громкость, кнопки управления."""
 import asyncio
+import importlib.util
 import os
 import random
+import re
 import shutil
 import time
 from collections import deque
@@ -11,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from ..util import has_any_role, is_staff, make_embed
+from ..util import has_any_role, is_staff, make_embed, staff_only
 
 try:
     import yt_dlp
@@ -22,9 +24,18 @@ FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 LOOP_LABEL = {"off": "выкл.", "track": "трек", "queue": "очередь"}
 
 
+def _js_runtimes() -> dict:
+    """YouTube требует внешний JS-движок для yt-dlp (node/deno/bun) — подключаем, что установлено."""
+    return {n: {} for n in ("deno", "node", "bun") if shutil.which(n)}
+
+
 def _ydl_opts(extra=None):
     o = {"format": "bestaudio/best", "quiet": True, "no_warnings": True, "default_search": "auto",
-         "noplaylist": True, "source_address": "0.0.0.0", "socket_timeout": 15}
+         "noplaylist": True, "source_address": "0.0.0.0", "socket_timeout": 15, "retries": 2}
+    rt = _js_runtimes()
+    if rt:
+        o["js_runtimes"] = rt
+        o["remote_components"] = ["ejs:github"]
     if os.getenv("YTDL_COOKIES") and os.path.exists(os.getenv("YTDL_COOKIES")):
         o["cookiefile"] = os.getenv("YTDL_COOKIES")
     o.update(extra or {})
@@ -34,6 +45,31 @@ def _ydl_opts(extra=None):
 def _extract(query: str, extra=None):
     with yt_dlp.YoutubeDL(_ydl_opts(extra)) as ydl:
         return ydl.extract_info(query, download=False)
+
+
+def voice_report() -> list[tuple[bool, str]]:
+    """Что нужно для музыки и чего не хватает (используется в /status и /musiccheck)."""
+    bad = []
+    if not shutil.which("ffmpeg"):
+        bad.append((False, "Музыка: не установлен FFmpeg"))
+    if yt_dlp is None:
+        bad.append((False, "Музыка: не установлен yt-dlp"))
+    try:
+        import nacl  # noqa: F401
+    except ImportError:
+        bad.append((False, "Музыка: не установлен PyNaCl (pip install pynacl)"))
+    if importlib.util.find_spec("davey") is None:
+        bad.append((False, "Музыка: не установлен davey — Discord требует шифрование голоса DAVE (pip install davey)"))
+    if not discord.opus.is_loaded():
+        bad.append((False, "Музыка: не найдена библиотека Opus (на Linux: apt install libopus0)"))
+    if not _js_runtimes():
+        bad.append((None, "Музыка: нет Node.js/Deno — YouTube может не открываться (SoundCloud будет работать)"))
+    return bad or [(True, "Музыка: все компоненты на месте (FFmpeg, голос, yt-dlp)")]
+
+
+def _short(e, n=160) -> str:
+    t = re.sub(r'\x1b\[[0-9;]*m', '', str(e) if e else '').replace('ERROR: ', '').strip()
+    return t[:n] + ('…' if len(t) > n else '')
 
 
 def fmt_dur(sec) -> str:
@@ -53,6 +89,7 @@ class Track:
     requester: int
     thumb: str | None = None
     stream: str | None = None
+    resolved_at: float = 0.0
 
 
 @dataclass
@@ -65,6 +102,7 @@ class Player:
     text: discord.abc.Messageable | None = None
     idle_since: float = field(default_factory=time.monotonic)
     alone_since: float | None = None
+    started: float = 0.0
 
 
 class Controls(discord.ui.View):
@@ -105,6 +143,13 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.players: dict[int, Player] = {}
+        if not discord.opus.is_loaded():
+            for name in ("libopus.so.0", "libopus.so", "opus", "libopus-0.dll", "/opt/homebrew/lib/libopus.dylib"):
+                try:
+                    discord.opus.load_opus(name)
+                    break
+                except Exception:
+                    continue
         self.watchdog.start()
 
     def cog_unload(self):
@@ -139,10 +184,12 @@ class Music(commands.Cog):
 
     # ---------- воспроизведение ----------
     async def resolve(self, track: Track) -> str:
+        if track.stream and time.time() - track.resolved_at < 600:
+            return track.stream
         info = await asyncio.to_thread(_extract, track.page_url)
         if "entries" in info:
             info = info["entries"][0]
-        track.stream = info["url"]
+        track.stream, track.resolved_at = info["url"], time.time()
         track.duration = track.duration or info.get("duration")
         return track.stream
 
@@ -166,21 +213,31 @@ class Music(commands.Cog):
             stream = await self.resolve(track)
         except Exception as e:
             if p.text:
-                await p.text.send(f"⚠️ Не удалось воспроизвести **{track.title}**: {str(e)[:150]}")
+                await p.text.send(f"⚠️ Не удалось получить поток для **{track.title}**: {_short(e)}")
             p.current = None
+            p.loop = "off"
             return await self.play_next(guild)
         s = await self.bot.db.settings(guild.id)
         src = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(stream, before_options=FFMPEG_BEFORE, options="-vn"), volume=p.volume)
+        p.started = time.monotonic()
 
         def after(err):
-            if err:
-                print("player error:", err)
+            quick = time.monotonic() - p.started < 3 and not p.skipped
+            if err or quick:
+                async def warn():
+                    if p.text:
+                        await p.text.send(f"⚠️ Трек **{track.title}** сразу прервался"
+                                          + (f": {_short(err)}" if err else " (источник отклонил поток или FFmpeg не смог его открыть)") + ". Пропускаю.")
+                    p.loop = "off"
+                asyncio.run_coroutine_threadsafe(warn(), self.bot.loop)
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.bot.loop)
 
         try:
             vc.play(src, after=after)
-        except discord.ClientException:
+        except discord.ClientException as e:
+            if p.text:
+                await p.text.send(f"⚠️ Не удалось начать воспроизведение: {_short(e)}")
             return
         if p.text:
             e = self.np_embed(s, p, guild)
@@ -212,11 +269,33 @@ class Music(commands.Cog):
             vc.stop()
 
     # ---------- команды ----------
+    async def search(self, query: str, pref: str):
+        """Возвращает (список записей, список ошибок). Источники: YouTube, затем SoundCloud (режим «авто»)."""
+        is_url = query.startswith(("http://", "https://"))
+        playlist = is_url and ("list=" in query and "watch?v=" not in query or "/sets/" in query or "/playlist" in query)
+        if is_url:
+            attempts = [(query, {"noplaylist": False, "extract_flat": "in_playlist", "playlistend": 50} if playlist else None)]
+        else:
+            order = {"youtube": ["ytsearch1"], "soundcloud": ["scsearch1"]}.get(pref, ["ytsearch1", "scsearch1"])
+            attempts = [(f"{p}:{query}", None) for p in order]
+        errors = []
+        for q, extra in attempts:
+            try:
+                info = await asyncio.wait_for(asyncio.to_thread(_extract, q, extra), 45)
+            except Exception as e:
+                errors.append(f"{q.split(':')[0] if not is_url else 'ссылка'}: {_short(e)}")
+                continue
+            entries = [x for x in (info.get("entries") or [info]) if x][:50]
+            if entries:
+                return entries, errors
+            errors.append("ничего не найдено")
+        return None, errors
+
     @app_commands.command(name="play", description="Включить трек или добавить в очередь (название или ссылка)")
     @app_commands.guild_only()
     async def play(self, interaction: discord.Interaction, query: str):
         if yt_dlp is None or not shutil.which("ffmpeg"):
-            return await interaction.response.send_message("На хостинге не установлен FFmpeg или yt-dlp — музыка недоступна.", ephemeral=True)
+            return await interaction.response.send_message("На сервере, где запущен бот, нет FFmpeg или yt-dlp — музыка недоступна. Подробности: /musiccheck", ephemeral=True)
         err = await self._gate(interaction, control=False)
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
@@ -228,32 +307,24 @@ class Music(commands.Cog):
         vc = guild.voice_client
         try:
             if not vc:
-                vc = await interaction.user.voice.channel.connect(self_deaf=True)
+                vc = await interaction.user.voice.channel.connect(self_deaf=True, timeout=30)
             elif vc.channel != interaction.user.voice.channel:
                 return await interaction.followup.send("Бот уже играет в другом канале.")
-        except (discord.ClientException, asyncio.TimeoutError):
-            return await interaction.followup.send("Не удалось подключиться к голосовому каналу.")
-        p.text = interaction.channel
-        p.volume = p.volume if (vc.is_playing() or vc.is_paused()) else int(s.get("default_volume") or 50) / 100
-        is_playlist = "list=" in query and "watch?v=" not in query or "/sets/" in query or "/playlist" in query
-        search = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
-        try:
-            if is_playlist:
-                info = await asyncio.to_thread(_extract, query, {"noplaylist": False, "extract_flat": "in_playlist", "playlistend": 50})
-            else:
-                try:
-                    info = await asyncio.to_thread(_extract, search)
-                except Exception:
-                    if search.startswith("ytsearch"):
-                        info = await asyncio.to_thread(_extract, f"scsearch1:{query}")
-                    else:
-                        raise
+        except discord.ConnectionClosed as e:
+            return await interaction.followup.send(f"Discord закрыл голосовое соединение (код {e.code}). Обычно это значит, что не установлен `davey` "
+                                                   "(шифрование DAVE) — выполните /musiccheck.")
         except Exception as e:
-            return await interaction.followup.send(f"Не нашёл или не смог открыть: {str(e)[:200]}")
-        entries = info.get("entries") if "entries" in info else [info]
-        entries = [x for x in entries if x][:50]
+            return await interaction.followup.send(f"Не удалось подключиться к голосовому каналу: {_short(e)}. Проверьте права бота «Подключаться» и «Говорить», и /musiccheck.")
+        p.text = interaction.channel
+        busy = vc.is_playing() or vc.is_paused() or p.current is not None
+        if not busy:
+            p.volume = int(s.get("default_volume") or 50) / 100
+        entries, errors = await self.search(query, s.get("music_source") or "auto")
         if not entries:
-            return await interaction.followup.send("Ничего не найдено.")
+            if not busy and not vc.is_playing():
+                await vc.disconnect()
+            return await interaction.followup.send("Ничего не получилось найти или открыть.\n" + "\n".join(f"• {e}" for e in errors[:3]) +
+                                                   "\nПроверьте /musiccheck — там видно, чего не хватает.")
         maxq = int(s.get("max_queue") or 100)
         added = []
         for x in entries:
@@ -262,23 +333,42 @@ class Music(commands.Cog):
             url = x.get("webpage_url") or x.get("url") or x.get("original_url")
             if not url:
                 continue
-            t = Track(title=x.get("title") or "Без названия", page_url=url, duration=x.get("duration"),
-                      requester=interaction.user.id, thumb=x.get("thumbnail") or (x.get("thumbnails") or [{}])[-1].get("url"))
+            t = Track(title=x.get("title") or "Без названия", page_url=url, duration=x.get("duration"), requester=interaction.user.id,
+                      thumb=x.get("thumbnail") or (x.get("thumbnails") or [{}])[-1].get("url"))
+            if len(entries) == 1 and x.get("url") and x.get("formats"):  # из поиска сразу пришла прямая ссылка на поток
+                t.stream, t.resolved_at = x["url"], time.time()
             p.queue.append(t)
             added.append(t)
         if not added:
             return await interaction.followup.send("Очередь заполнена.")
-        playing = vc.is_playing() or vc.is_paused() or p.current is not None
         if len(added) == 1:
             t = added[0]
-            e = make_embed(s, title="➕ Добавлено в очередь" if playing else "🎵 Загружаю", desc=f"**[{t.title}]({t.page_url})** · {fmt_dur(t.duration)}")
+            e = make_embed(s, title="➕ Добавлено в очередь" if busy else "🎵 Загружаю", desc=f"**[{t.title}]({t.page_url})** · {fmt_dur(t.duration)}")
             if t.thumb:
                 e.set_thumbnail(url=t.thumb)
         else:
             e = make_embed(s, title="➕ Плейлист добавлен", desc=f"Треков: **{len(added)}**")
         await interaction.followup.send(embed=e)
-        if not playing:
+        if not busy:
             await self.play_next(guild)
+
+    @app_commands.command(name="musiccheck", description="Проверить, всё ли готово для музыки, и что мешает")
+    @app_commands.guild_only()
+    @staff_only()
+    async def musiccheck(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        lines = [f"{'✅' if ok else '⚠️' if ok is None else '❌'} {t}" for ok, t in voice_report()]
+        if yt_dlp:
+            lines.append(f"ℹ️ yt-dlp {yt_dlp.version.__version__}, JS-движки: {', '.join(_js_runtimes()) or 'нет'}")
+            for label, q in (("YouTube", "ytsearch1:music"), ("SoundCloud", "scsearch1:music")):
+                t0 = time.monotonic()
+                try:
+                    info = await asyncio.wait_for(asyncio.to_thread(_extract, q), 45)
+                    ok = bool((info.get("entries") or [None])[0])
+                    lines.append(f"{'✅' if ok else '❌'} {label}: поиск {'работает' if ok else 'ничего не вернул'} ({time.monotonic() - t0:.1f} с)")
+                except Exception as e:
+                    lines.append(f"❌ {label}: {_short(e, 220)}")
+        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
 
     @app_commands.command(name="pause", description="Пауза / продолжить")
     @app_commands.guild_only()

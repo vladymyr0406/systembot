@@ -170,7 +170,9 @@ def create_app(bot) -> FastAPI:
         actions += [{"value": f"ticket:{k}", "label": f"Тикет: {v.get('name', k)}"} for k, v in tickets.items()]
         actions += [{"value": "cab:home", "label": "Личный кабинет"}, {"value": "file:me", "label": "Моё личное дело"},
                     {"value": "roster:show", "label": "Показать составы"}]
-        return {"channels": chans, "roles": roles, "settings_schema": SETTINGS_SCHEMA, "item_schemas": ITEM_SCHEMAS,
+        return {"forms": [{"value": k, "label": v.get("title") or k} for k, v in forms.items()],
+                "tickets": [{"value": k, "label": v.get("name") or k} for k, v in tickets.items()],
+                "channels": chans, "roles": roles, "settings_schema": SETTINGS_SCHEMA, "item_schemas": ITEM_SCHEMAS,
                 "actions": actions, "guild": {"id": str(g.id), "name": g.name, "icon": g.icon.url if g.icon else None}}
 
     @app.get("/api/g/{gid}/overview")
@@ -260,6 +262,11 @@ def create_app(bot) -> FastAPI:
             cog = bot.get_cog("HR")
             if cog:
                 await cog.refresh_roster(g)
+        if kind == "panel" and data.get("_msg"):  # панель уже в Discord — обновляем её сразу
+            _, err = await publish_panel(bot, g, key)
+            data = await bot.db.item(g.id, kind, key) or data
+            if err:
+                data["_publish_error"] = err
         return data
 
     @app.delete("/api/g/{gid}/items/{kind}/{key}")

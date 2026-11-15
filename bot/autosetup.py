@@ -46,7 +46,6 @@ PLAN = [
             ch("🔨", "логи-модерации", "", [("setting", "log_mod")]),
             ch("📋", "логи-заявок", "", [("setting", "log_forms")]),
             ch("🎟️", "логи-тикетов", "", [("setting", "log_tickets")]),
-            ch("💾", "бэкапы-бота", "Сюда бот складывает резервные копии базы", []),
         ]}]},
 ]
 SECTION_KEYS = [s["key"] for s in PLAN]
@@ -139,8 +138,6 @@ async def run(bot, guild: discord.Guild, keys, publish: bool = True, overwrite: 
                     continue
                 for kind, key in c["bind"]:
                     await bind(kind, key, target.id)
-                if c["name"].endswith("бэкапы-бота"):
-                    res["backup_channel_id"] = str(target.id)
     await db.set_setting(guild.id, CREATED_KEY, created)
     if publish:
         for key in dict.fromkeys(to_publish):
@@ -196,8 +193,6 @@ def format_result(res: dict) -> str:
         lines.append(f"**Опубликованы панели:** " + ", ".join(res["published"]))
     if res["bound"]:
         lines.append(f"**Привязано к настройкам:** {len(res['bound'])}")
-    if res.get("backup_channel_id"):
-        lines.append(f"💾 Для резервных копий впишите в переменную `BACKUP_CHANNEL_ID` значение `{res['backup_channel_id']}`.")
     if res["staff_missing"]:
         lines.append("ℹ️ Роли администрации не выбраны, поэтому закрытые каналы пока видят только администраторы сервера. "
                      "Выберите роли в настройках и дайте им доступ в правах этих каналов.")

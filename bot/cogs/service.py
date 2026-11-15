@@ -1,7 +1,7 @@
 """Служебное: /status (что включено и что работает), резервные копии, keep-alive для бесплатных хостингов."""
 import asyncio
 import logging
-import shutil
+import time
 
 import discord
 import httpx
@@ -9,6 +9,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from .. import config
+from .. import backup
 from ..backup import make_backup
 from ..schema import MODULES
 from ..util import make_embed, staff_only
@@ -39,9 +40,14 @@ async def collect_status(bot, guild: discord.Guild) -> dict:
     perms = guild.me.guild_permissions
     miss = [t for k, t in NEED_PERMS.items() if not getattr(perms, k)] if not perms.administrator else []
     add(not miss, "У бота достаточно прав" if not miss else "Боту не хватает прав: " + ", ".join(miss), None)
-    add(bool(shutil.which("ffmpeg")), "FFmpeg найден — музыка может работать" if shutil.which("ffmpeg") else "FFmpeg не установлен — музыка не заработает", None)
-    add(bool(config.BACKUP_CHANNEL_ID), "Резервные копии базы в Discord включены" if config.BACKUP_CHANNEL_ID
-        else "Резервные копии не настроены (BACKUP_CHANNEL_ID) — на хостинге со стираемым диском данные могут пропасть", None)
+    if backup.channel_id() and not backup.STATE["blocked"]:
+        add(True, f"Резервные копии базы включены (канал <#{backup.channel_id()}>) — настройки переживут перезапуск", None)
+    else:
+        why = backup.STATE["error"] or "канал для копий не найден и не создан (боту нужно право «Управление каналами»)"
+        add(False, f"Резервные копии не работают: {why}. На бесплатном хостинге настройки пропадут после перезапуска", None)
+    from .music import voice_report
+    for ok, text in voice_report():
+        add(ok, text, None)
     return {"modules": modules, "checks": checks}
 
 
@@ -52,29 +58,39 @@ class Service(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._last_changes = None
-        if config.BACKUP_CHANNEL_ID:
-            self.backup_loop.change_interval(minutes=config.BACKUP_MINUTES)
-            self.backup_loop.start()
+        self.backup_loop.start()
         if config.KEEPALIVE and config.BASE_URL.startswith("https") and "localhost" not in config.BASE_URL:
             self.keepalive.start()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Канал для копий находим или создаём; первая копия сразу, чтобы настройки уже были в безопасности."""
+        if not backup.channel_id():
+            await backup.find_channel(self.bot)
+        if not backup.channel_id():
+            await backup.ensure_channel(self.bot)
+        self._last_changes = None
 
     async def cog_unload(self):
         self.backup_loop.cancel()
         self.keepalive.cancel()
-        if config.BACKUP_CHANNEL_ID and self.bot.db.conn:
+        if backup.channel_id() and self.bot.db.conn and self.bot.db.conn.total_changes != self._last_changes:
             try:
                 await asyncio.wait_for(make_backup(self.bot, "выключение"), 20)
             except Exception:
                 log.exception("Не удалось сделать копию при выключении")
 
-    @tasks.loop(minutes=30)
+    @tasks.loop(seconds=20)
     async def backup_loop(self):
+        """Копия делается вскоре после любых изменений (не чаще раза в 25 секунд)."""
+        if not backup.channel_id() or backup.STATE["blocked"] or not self.bot.db.conn:
+            return
         changes = self.bot.db.conn.total_changes
-        if changes == self._last_changes:
+        if changes == self._last_changes or time.time() - backup.STATE["last"] < 25:
             return
         try:
-            await make_backup(self.bot)
-            self._last_changes = changes
+            if await make_backup(self.bot):
+                self._last_changes = changes
         except Exception:
             log.exception("Резервная копия не создана")
 
@@ -112,14 +128,16 @@ class Service(commands.Cog):
     async def backup(self, interaction: discord.Interaction):
         if interaction.user.id not in config.OWNER_IDS:
             return await interaction.response.send_message("Команда только для владельца бота (OWNER_IDS).", ephemeral=True)
-        if not config.BACKUP_CHANNEL_ID:
-            return await interaction.response.send_message("Не задан BACKUP_CHANNEL_ID — создайте приватный канал и укажите его ID.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
+        if not backup.channel_id():
+            await backup.ensure_channel(self.bot)
+        if not backup.channel_id():
+            return await interaction.followup.send(f"Канал для копий не создан: {backup.STATE['error'] or 'нужно право «Управление каналами»'}", ephemeral=True)
         try:
             url = await make_backup(self.bot, f"вручную, {interaction.user}")
         except Exception as e:
             return await interaction.followup.send(f"Не удалось: {e}", ephemeral=True)
-        await interaction.followup.send(f"💾 Готово: {url}", ephemeral=True)
+        await interaction.followup.send(f"💾 Готово: {url}" if url else "Копирование приостановлено (см. логи).", ephemeral=True)
 
 
 async def setup(bot):

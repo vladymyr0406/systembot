@@ -20,6 +20,16 @@ async def dispatch(interaction: discord.Interaction, action: str):
     mod = ACTION_MODULE.get(kind)
     if mod and not (await bot.db.settings(interaction.guild_id)).get(mod, True):
         return await interaction.response.send_message(f"Модуль «{MODULE_NAME[mod]}» отключён администрацией.", ephemeral=True)
+    if kind == "role":
+        return await toggle_role(interaction, arg)
+    if kind == "msg":
+        key, _, idx = arg.rpartition(":")
+        p = await bot.db.item(interaction.guild_id, "panel", key) or {}
+        try:
+            text = (p.get("buttons") or [])[int(idx)].get("reply") or ""
+        except (ValueError, IndexError):
+            text = ""
+        return await interaction.response.send_message(text or "Ответ не настроен.", ephemeral=True)
     cog = {"form": "Forms", "cab": "Cabinet", "ticket": "Tickets", "file": "HR", "roster": "HR"}.get(kind)
     handler = bot.get_cog(cog) if cog else None
     if not handler:
@@ -34,6 +44,26 @@ async def dispatch(interaction: discord.Interaction, action: str):
         await handler.show_file(interaction, interaction.user)
     elif kind == "roster":
         await handler.show_roster(interaction)
+
+
+async def toggle_role(interaction: discord.Interaction, rid: str):
+    role = interaction.guild.get_role(to_int(rid) or 0)
+    if not role:
+        return await interaction.response.send_message("Эта роль больше не существует.", ephemeral=True)
+    perms = role.permissions
+    if role.managed or perms.administrator or perms.manage_guild or perms.manage_roles or perms.manage_channels or perms.ban_members or perms.kick_members:
+        return await interaction.response.send_message("Эту роль нельзя выдавать кнопкой: у неё административные права.", ephemeral=True)
+    m = interaction.user
+    try:
+        if role in m.roles:
+            await m.remove_roles(role, reason="Кнопка панели")
+            txt = f"Роль {role.mention} снята."
+        else:
+            await m.add_roles(role, reason="Кнопка панели")
+            txt = f"Роль {role.mention} выдана."
+    except discord.Forbidden:
+        txt = "У бота нет прав выдавать эту роль (она выше роли бота или нет права «Управление ролями»)."
+    await interaction.response.send_message(txt, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 class ActionButton(discord.ui.DynamicItem[discord.ui.Button], template=r"rp:(?P<a>.+)"):
@@ -60,15 +90,17 @@ def panel_embed(s: dict, p: dict) -> discord.Embed:
     return e
 
 
-def panel_view(p: dict) -> discord.ui.View:
+def panel_view(p: dict, key: str = "") -> discord.ui.View:
     v = discord.ui.View(timeout=None)
-    for b in (p.get("buttons") or [])[:25]:
+    for i, b in enumerate((p.get("buttons") or [])[:25]):
         act = (b.get("action") or "").strip()
         label = (b.get("label") or "")[:80] or None
         emoji = (b.get("emoji") or "").strip() or None
         if act.startswith(("http://", "https://")):
             v.add_item(discord.ui.Button(label=label or "Открыть", url=act, emoji=emoji))
         elif act:
+            if act == "reply":
+                act = f"msg:{key or 'x'}:{i}"
             v.add_item(ActionButton(act, label, STYLES.get(b.get("style"), discord.ButtonStyle.secondary), emoji))
     return v
 
@@ -82,7 +114,7 @@ async def publish_panel(bot, guild: discord.Guild, key: str, channel=None):
     target = channel or guild.get_channel(to_int(p.get("channel")) or 0)
     if not target or not hasattr(target, "send"):
         return None, "Не выбран канал публикации."
-    embed, view = panel_embed(s, p), panel_view(p)
+    embed, view = panel_embed(s, p), panel_view(p, key)
     old = p.get("_msg") or {}
     try:
         msg = None
